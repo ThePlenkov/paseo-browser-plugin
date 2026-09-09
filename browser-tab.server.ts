@@ -163,13 +163,19 @@ function waitForPort(port: number, host: string, timeoutMs: number, proc?: Child
   const net = _require("node:net");
   return new Promise((resolve) => {
     const start = Date.now();
+    function isDead() {
+      return proc && (proc.exitCode !== null || proc.signalCode !== null || proc.killed);
+    }
     function tryConnect() {
-      if (proc && proc.exitCode !== null && proc.signalCode === null) return resolve(false);
-      if (proc && proc.killed) return resolve(false);
+      if (isDead()) return resolve(false);
       if (Date.now() - start > timeoutMs) return resolve(false);
       const sock = new net.Socket();
       sock.setTimeout(500);
-      sock.on("connect", () => { sock.destroy(); resolve(true); });
+      sock.on("connect", () => {
+        sock.destroy();
+        // Recheck after connect — child may have exited between the pre-check and the callback
+        resolve(!isDead());
+      });
       sock.on("error", () => { sock.destroy(); setTimeout(tryConnect, 100); });
       sock.on("timeout", () => { sock.destroy(); setTimeout(tryConnect, 100); });
       sock.connect(port, host);

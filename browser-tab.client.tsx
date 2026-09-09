@@ -3,7 +3,7 @@ import {
   useRpc,
 } from "@getpaseo/plugin";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ActivityIndicator, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { browserGetUrl } from "./browser-tab.shared";
 
 export function BrowserTabPanel({
@@ -38,7 +38,6 @@ export function BrowserTabPanel({
   );
 
   const init = useCallback(async () => {
-    // Prevent concurrent calls — Chromium startup takes several seconds
     if (loadingRef.current) return;
     loadingRef.current = true;
     setLoading(true);
@@ -59,11 +58,25 @@ export function BrowserTabPanel({
   }, [getUrlRpc]);
 
   useEffect(() => {
-    // Only auto-init once per component lifecycle
     if (initRef.current) return;
     initRef.current = true;
-    void init();
+    // Only start the VNC stack on web — mobile can't render iframes
+    if (Platform.OS === "web") {
+      void init();
+    } else {
+      setLoading(false);
+    }
   }, [init]);
+
+  if (Platform.OS !== "web") {
+    return (
+      <View style={styles.loading}>
+        <Text style={{ color: theme.colors.foregroundMuted, padding: 16, textAlign: "center" }}>
+          Browser tab is available on the Paseo web client. Open this workspace from a browser on the same host as the daemon.
+        </Text>
+      </View>
+    );
+  }
 
   if (loading) {
     return (
@@ -100,8 +113,6 @@ export function BrowserTabPanel({
     );
   }
 
-  // On web, render an iframe directly
-  // On mobile, this won't work — would need a WebView component
   return (
     <View style={styles.screen}>
       {/* @ts-ignore — iframe exists in web DOM */}

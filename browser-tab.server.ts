@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync, statSync } from "node:fs";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync, statSync, accessSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve, normalize, delimiter, sep } from "node:path";
 import { tmpdir } from "node:os";
 import type { output as ZodOutput } from "zod";
@@ -118,7 +118,10 @@ function findBin(name: string): string {
   // Common system locations
   candidates.push(`/usr/bin/${name}`, `/usr/local/bin/${name}`, `/nix/var/nix/profiles/default/bin/${name}`);
   for (const p of candidates) {
-    if (existsSync(p)) return p;
+    try {
+      accessSync(p, _require("node:fs").constants.X_OK);
+      return p;
+    } catch {}
   }
   throw new Error(`Binary not found: ${name}. Install it or add to PATH.`);
 }
@@ -289,7 +292,7 @@ async function startVncStack(): Promise<void> {
       // 5. websockify (internal)
       log("websockify", `proxying on internal port ${WS_INTERNAL}`);
       websockifyProcess = spawn(findBin("websockify"), [
-        String(WS_INTERNAL),
+        `127.0.0.1:${WS_INTERNAL}`,
         `127.0.0.1:${VNC_PORT}`,
       ], { stdio: ["ignore", "pipe", "pipe"] });
       websockifyProcess.stderr?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
@@ -311,9 +314,9 @@ async function startVncStack(): Promise<void> {
           res.end(NOVNC_EMBED_HTML);
           return;
         }
-        // Serve noVNC files — prevent path traversal + directory access
-        const filePath = resolve(join(novncPathResolved, urlPath));
-        if (filePath.startsWith(novncPathResolved + sep) && existsSync(filePath) && statSync(filePath).isFile()) {
+        // Serve noVNC files — prevent path traversal + directory access + symlink escape
+        const filePath = realpathSync(resolve(join(novncPathResolved, urlPath)));
+        if (filePath.startsWith(novncPathResolved + sep) && statSync(filePath).isFile()) {
           const ext = filePath.endsWith(".js") ? "application/javascript"
             : filePath.endsWith(".css") ? "text/css"
             : filePath.endsWith(".json") ? "application/json"
@@ -396,4 +399,6 @@ export async function cleanupSessions(): Promise<void> {
   if (bridgeWs) { try { bridgeWs.close(); } catch {} bridgeWs = null; }
   if (httpServer) { try { httpServer.close(); } catch {} httpServer = null; }
   killAll();
+  // Clean up the Chrome profile temp directory
+  try { rmSync(CHROME_PROFILE, { recursive: true, force: true }); } catch {}
 }

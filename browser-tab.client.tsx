@@ -72,7 +72,7 @@ export function BrowserTabPanel({
     return (
       <View style={styles.loading}>
         <Text style={{ color: theme.colors.foregroundMuted, padding: 16, textAlign: "center" }}>
-          Browser tab is available on the Paseo web client. Open this workspace from a browser at http://127.0.0.1:6767/
+          Browser tab is available on the Paseo web client. Open this workspace from a browser on the same host as the daemon.
         </Text>
       </View>
     );

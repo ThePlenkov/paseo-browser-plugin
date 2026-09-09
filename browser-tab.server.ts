@@ -1,12 +1,12 @@
-import { spawn, type ChildProcess, execSync } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, resolve, normalize } from "node:path";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync } from "node:fs";
+import { join, resolve, normalize, delimiter } from "node:path";
+import { tmpdir } from "node:os";
 import type { output as ZodOutput } from "zod";
 import { browserGetUrl } from "./browser-tab.shared";
 
 const _require = eval("require");
-const _fs = _require("node:fs");
 
 let xvfbProcess: ChildProcess | null = null;
 let chromiumProcess: ChildProcess | null = null;
@@ -15,12 +15,16 @@ let websockifyProcess: ChildProcess | null = null;
 let fluxboxProcess: ChildProcess | null = null;
 let httpServer: any = null;
 let bridgeWs: any = null;
-let startingUp = false;
+let startupPromise: Promise<void> | null = null;
+let cancelled = false;
 
 const DISPLAY = ":99";
 const VNC_PORT = 5999;
 const WS_INTERNAL = 9224;
 const WEB_PORT = 9223;
+
+// Chrome profile in a secure temp directory (not world-writable /tmp)
+const CHROME_PROFILE = mkdtempSync(join(tmpdir(), "browser-tab-chrome-"));
 
 // --- Fluxbox configs (embedded) ---
 const FLUXBOX_KEYS = `# No close, no kill, no window menu, no exit
@@ -101,25 +105,38 @@ const NOVNC_EMBED_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// --- Binary path resolution (no hardcoded paths) ---
+// --- Binary path resolution (no execSync, no hardcoded paths) ---
 function findBin(name: string): string {
-  try {
-    const path = execSync(`which ${name} 2>/dev/null`, { encoding: "utf-8" }).trim();
-    if (path) return path;
-  } catch {}
-  const nixBin = `/home/pepl/.nix-profile/bin/${name}`;
-  if (existsSync(nixBin)) return nixBin;
-  for (const p of [`/usr/bin/${name}`, `/usr/local/bin/${name}`, `/nix/var/nix/profiles/default/bin/${name}`]) {
+  const candidates: string[] = [];
+  // Search PATH directories
+  for (const dir of (process.env.PATH || "").split(delimiter)) {
+    if (dir) candidates.push(join(dir, name));
+  }
+  // Nix profile (via HOME, not hardcoded)
+  const home = process.env.HOME || "";
+  if (home) candidates.push(join(home, ".nix-profile/bin", name));
+  // Common system locations
+  candidates.push(`/usr/bin/${name}`, `/usr/local/bin/${name}`, `/nix/var/nix/profiles/default/bin/${name}`);
+  for (const p of candidates) {
     if (existsSync(p)) return p;
   }
   throw new Error(`Binary not found: ${name}. Install it or add to PATH.`);
 }
 
 function findNovncPath(): string {
-  try {
-    const result = execSync("ls -d /nix/store/*/share/webapps/novnc 2>/dev/null | head -1", { encoding: "utf-8" }).trim();
-    if (result) return result;
-  } catch {}
+  // Search Nix store via readdirSync (no shell, no glob)
+  const nixStore = "/nix/store";
+  if (existsSync(nixStore)) {
+    try {
+      for (const entry of readdirSync(nixStore)) {
+        if (entry.includes("novnc")) {
+          const candidate = join(nixStore, entry, "share/webapps/novnc");
+          if (existsSync(candidate)) return candidate;
+        }
+      }
+    } catch {}
+  }
+  // Common system locations
   for (const p of ["/usr/share/novnc", "/usr/share/webapps/novnc", "/var/www/novnc"]) {
     if (existsSync(p)) return p;
   }
@@ -138,171 +155,26 @@ function log(tag: string, msg: string) {
   console.log(`[browser-tab] ${tag}: ${msg}`);
 }
 
-async function startVncStack(): Promise<void> {
-  if (xvfbProcess && !xvfbProcess.killed) return;
-  if (startingUp) return;
-  startingUp = true;
-
-  try {
-    try { _fs.unlinkSync("/tmp/browser-tab-chrome-profile/SingletonLock"); } catch {}
-
-    const x11Env: Record<string, string> = { ...process.env as Record<string, string>, DISPLAY, XDG_SESSION_TYPE: "x11" };
-    delete x11Env.WAYLAND_DISPLAY;
-
-    // 1. Xvfb
-    log("Xvfb", `starting on ${DISPLAY}`);
-    xvfbProcess = spawn(findBin("Xvfb"), [
-      DISPLAY, "-screen", "0", "1280x800x24", "-ac", "+extension", "RANDR",
-    ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
-    xvfbProcess.stderr?.on("data", (d: Buffer) => console.log("[xvfb]", d.toString().trim()));
-    await sleep(500);
-
-    // 2. Fluxbox (embedded configs — no toolbar, no close)
-    log("Fluxbox", "starting");
-    const fluxboxHome = join(process.cwd(), ".fluxbox-plugin");
-    const fluxboxConf = join(fluxboxHome, ".fluxbox");
-    mkdirSync(fluxboxConf, { recursive: true });
-    writeFileSync(join(fluxboxConf, "keys"), FLUXBOX_KEYS);
-    writeFileSync(join(fluxboxConf, "init"), FLUXBOX_INIT);
-    writeFileSync(join(fluxboxConf, "menu"), FLUXBOX_MENU);
-    fluxboxProcess = spawn(findBin("fluxbox"), ["-d", DISPLAY], {
-      stdio: ["ignore", "pipe", "pipe"],
-      env: { ...x11Env, HOME: fluxboxHome },
-    });
-    fluxboxProcess.stderr?.on("data", () => {});
-    await sleep(300);
-
-    // 3. Chromium (auto-restarts on close)
-    const chromiumPath = getChromiumPath();
-    log("Chromium", `launching: ${chromiumPath}`);
-
-    function launchChromium() {
-      try { _fs.unlinkSync("/tmp/browser-tab-chrome-profile/SingletonLock"); } catch {}
-      const proc = spawn(chromiumPath, [
-        "--no-sandbox", "--disable-setuid-sandbox",
-        "--disable-gpu", "--disable-dev-shm-usage",
-        "--user-data-dir=/tmp/browser-tab-chrome-profile",
-        "--password-store=basic", "--use-mock-keychain",
-        "--disable-keychain", "--disable-features=PasswordStore",
-        "--start-maximized",
-        "--no-first-run", "--no-default-browser-check",
-        "--disable-infobars",
-      ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
-      proc.stderr?.on("data", () => {});
-      proc.stdout?.on("data", () => {});
-      proc.on("exit", (code) => {
-        log("Chromium", `exited with code ${code} — restarting in 1s`);
-        chromiumProcess = null;
-        setTimeout(() => {
-          if (xvfbProcess && !xvfbProcess.killed) {
-            log("Chromium", "restarting");
-            chromiumProcess = launchChromium();
-          }
-        }, 1000);
-      });
-      return proc;
+// --- Readiness check: wait for a TCP port to be connectable ---
+function waitForPort(port: number, host: string, timeoutMs: number): Promise<boolean> {
+  const net = _require("node:net");
+  return new Promise((resolve) => {
+    const start = Date.now();
+    function tryConnect() {
+      if (Date.now() - start > timeoutMs) return resolve(false);
+      const sock = new net.Socket();
+      sock.setTimeout(500);
+      sock.on("connect", () => { sock.destroy(); resolve(true); });
+      sock.on("error", () => { sock.destroy(); setTimeout(tryConnect, 100); });
+      sock.on("timeout", () => { sock.destroy(); setTimeout(tryConnect, 100); });
+      sock.connect(port, host);
     }
-
-    chromiumProcess = launchChromium();
-    await sleep(1000);
-
-    // 4. x11vnc (localhost only — not exposed externally)
-    log("x11vnc", `starting on port ${VNC_PORT}`);
-    x11vncProcess = spawn(findBin("x11vnc"), [
-      "-display", DISPLAY,
-      "-rfbport", String(VNC_PORT),
-      "-localhost",
-      "-nopw", "-forever", "-shared", "-noxdamage",
-    ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
-    x11vncProcess.stderr?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
-    x11vncProcess.stdout?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
-    await sleep(500);
-
-    // 5. websockify (internal)
-    log("websockify", `proxying on internal port ${WS_INTERNAL}`);
-    websockifyProcess = spawn(findBin("websockify"), [
-      String(WS_INTERNAL),
-      `127.0.0.1:${VNC_PORT}`,
-    ], { stdio: ["ignore", "pipe", "pipe"] });
-    websockifyProcess.stderr?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
-    websockifyProcess.stdout?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
-    await sleep(500);
-
-    // 6. HTTP server — serves embedded noVNC page + proxies WebSocket
-    const novncPath = findNovncPath();
-    const novncPathResolved = resolve(novncPath);
-    const WebSocket = _require("ws");
-
-    httpServer = createServer((req, res) => {
-      const urlPath = (req.url || "/").split("?")[0];
-      if (urlPath === "/" || urlPath === "/index.html") {
-        res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(NOVNC_EMBED_HTML);
-        return;
-      }
-      // Serve noVNC files — prevent path traversal
-      const filePath = normalize(resolve(join(novncPathResolved, urlPath)));
-      if (filePath.startsWith(novncPathResolved) && existsSync(filePath)) {
-        const ext = filePath.endsWith(".js") ? "application/javascript"
-          : filePath.endsWith(".css") ? "text/css"
-          : filePath.endsWith(".json") ? "application/json"
-          : filePath.endsWith(".wasm") ? "application/wasm"
-          : "text/html";
-        res.writeHead(200, { "Content-Type": ext });
-        res.end(readFileSync(filePath));
-        return;
-      }
-      res.writeHead(404);
-      res.end("Not found");
-    });
-
-    bridgeWs = new WebSocket.Server({ server: httpServer, path: "/websockify" });
-    bridgeWs.on("connection", (clientWs: any) => {
-      const targetWs = new WebSocket(`ws://127.0.0.1:${WS_INTERNAL}`);
-      targetWs.on("error", (err: Error) => {
-        console.error("[websockify bridge] target error:", err.message);
-        try { clientWs.close(); } catch {}
-      });
-      targetWs.on("open", () => {
-        clientWs.on("message", (data: Buffer) => {
-          if (targetWs.readyState === WebSocket.OPEN) targetWs.send(data);
-        });
-        targetWs.on("message", (data: Buffer) => {
-          if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
-        });
-      });
-      clientWs.on("close", () => { try { targetWs.close(); } catch {} });
-      targetWs.on("close", () => { try { clientWs.close(); } catch {} });
-    });
-
-    await new Promise((resolve) => httpServer.listen(WEB_PORT, "127.0.0.1", resolve));
-    log("http", `serving on http://127.0.0.1:${WEB_PORT}`);
-  } finally {
-    startingUp = false;
-  }
+    tryConnect();
+  });
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
-}
-
-export async function handleGetUrl(
-  _input: ZodOutput<typeof browserGetUrl.input>,
-): Promise<ZodOutput<typeof browserGetUrl.output>> {
-  try {
-    await startVncStack();
-    return { url: `http://127.0.0.1:${WEB_PORT}/`, error: null };
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.error("[browser-tab] GetUrl error:", msg);
-    return { url: "", error: msg };
-  }
-}
-
-export async function cleanupSessions(): Promise<void> {
-  startingUp = false; // cancel any in-progress startup
-  if (bridgeWs) { try { bridgeWs.close(); } catch {} bridgeWs = null; }
-  if (httpServer) { try { httpServer.close(); } catch {} httpServer = null; }
+// --- Kill all spawned processes (used on failure and cleanup) ---
+function killAll(): void {
   for (const [name, proc] of [
     ["websockify", websockifyProcess],
     ["x11vnc", x11vncProcess],
@@ -320,4 +192,208 @@ export async function cleanupSessions(): Promise<void> {
   chromiumProcess = null;
   fluxboxProcess = null;
   xvfbProcess = null;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function startVncStack(): Promise<void> {
+  if (xvfbProcess && !xvfbProcess.killed) return;
+  if (startupPromise) return startupPromise;
+
+  cancelled = false;
+  startupPromise = (async () => {
+    try {
+      try { _require("node:fs").unlinkSync(join(CHROME_PROFILE, "SingletonLock")); } catch {}
+
+      const x11Env: Record<string, string> = { ...process.env as Record<string, string>, DISPLAY, XDG_SESSION_TYPE: "x11" };
+      delete x11Env.WAYLAND_DISPLAY;
+
+      // 1. Xvfb
+      log("Xvfb", `starting on ${DISPLAY}`);
+      xvfbProcess = spawn(findBin("Xvfb"), [
+        DISPLAY, "-screen", "0", "1280x800x24", "-ac", "+extension", "RANDR",
+      ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
+      xvfbProcess.stderr?.on("data", (d: Buffer) => console.log("[xvfb]", d.toString().trim()));
+      await sleep(500);
+      if (cancelled) throw new Error("startup cancelled");
+
+      // 2. Fluxbox (embedded configs — no toolbar, no close)
+      log("Fluxbox", "starting");
+      const fluxboxHome = join(process.cwd(), ".fluxbox-plugin");
+      const fluxboxConf = join(fluxboxHome, ".fluxbox");
+      mkdirSync(fluxboxConf, { recursive: true });
+      writeFileSync(join(fluxboxConf, "keys"), FLUXBOX_KEYS);
+      writeFileSync(join(fluxboxConf, "init"), FLUXBOX_INIT);
+      writeFileSync(join(fluxboxConf, "menu"), FLUXBOX_MENU);
+      fluxboxProcess = spawn(findBin("fluxbox"), ["-d", DISPLAY], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...x11Env, HOME: fluxboxHome },
+      });
+      fluxboxProcess.stderr?.on("data", () => {});
+      await sleep(300);
+      if (cancelled) throw new Error("startup cancelled");
+
+      // 3. Chromium (auto-restarts on close)
+      const chromiumPath = getChromiumPath();
+      log("Chromium", `launching: ${chromiumPath}`);
+
+      function launchChromium() {
+        try { _require("node:fs").unlinkSync(join(CHROME_PROFILE, "SingletonLock")); } catch {}
+        const proc = spawn(chromiumPath, [
+          "--no-sandbox", "--disable-setuid-sandbox",
+          "--disable-gpu", "--disable-dev-shm-usage",
+          `--user-data-dir=${CHROME_PROFILE}`,
+          "--password-store=basic", "--use-mock-keychain",
+          "--disable-keychain", "--disable-features=PasswordStore",
+          "--start-maximized",
+          "--no-first-run", "--no-default-browser-check",
+          "--disable-infobars",
+        ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
+        proc.stderr?.on("data", () => {});
+        proc.stdout?.on("data", () => {});
+        proc.on("exit", (code) => {
+          log("Chromium", `exited with code ${code} — restarting in 1s`);
+          chromiumProcess = null;
+          setTimeout(() => {
+            if (xvfbProcess && !xvfbProcess.killed) {
+              log("Chromium", "restarting");
+              chromiumProcess = launchChromium();
+            }
+          }, 1000);
+        });
+        return proc;
+      }
+
+      chromiumProcess = launchChromium();
+      await sleep(1000);
+      if (cancelled) throw new Error("startup cancelled");
+
+      // 4. x11vnc (localhost only — not exposed externally)
+      log("x11vnc", `starting on port ${VNC_PORT}`);
+      x11vncProcess = spawn(findBin("x11vnc"), [
+        "-display", DISPLAY,
+        "-rfbport", String(VNC_PORT),
+        "-localhost",
+        "-nopw", "-forever", "-shared", "-noxdamage",
+      ], { stdio: ["ignore", "pipe", "pipe"], env: x11Env });
+      x11vncProcess.stderr?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
+      x11vncProcess.stdout?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
+      // Wait for VNC port readiness instead of fixed sleep
+      if (!await waitForPort(VNC_PORT, "127.0.0.1", 5000)) {
+        throw new Error("x11vnc did not become ready");
+      }
+      if (cancelled) throw new Error("startup cancelled");
+
+      // 5. websockify (internal)
+      log("websockify", `proxying on internal port ${WS_INTERNAL}`);
+      websockifyProcess = spawn(findBin("websockify"), [
+        String(WS_INTERNAL),
+        `127.0.0.1:${VNC_PORT}`,
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      websockifyProcess.stderr?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
+      websockifyProcess.stdout?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
+      if (!await waitForPort(WS_INTERNAL, "127.0.0.1", 5000)) {
+        throw new Error("websockify did not become ready");
+      }
+      if (cancelled) throw new Error("startup cancelled");
+
+      // 6. HTTP server — serves embedded noVNC page + proxies WebSocket
+      const novncPath = findNovncPath();
+      const novncPathResolved = resolve(novncPath);
+      const WebSocket = _require("ws");
+
+      httpServer = createServer((req, res) => {
+        const urlPath = (req.url || "/").split("?")[0];
+        if (urlPath === "/" || urlPath === "/index.html") {
+          res.writeHead(200, { "Content-Type": "text/html" });
+          res.end(NOVNC_EMBED_HTML);
+          return;
+        }
+        // Serve noVNC files — prevent path traversal
+        const filePath = normalize(resolve(join(novncPathResolved, urlPath)));
+        if (filePath.startsWith(novncPathResolved) && existsSync(filePath)) {
+          const ext = filePath.endsWith(".js") ? "application/javascript"
+            : filePath.endsWith(".css") ? "text/css"
+            : filePath.endsWith(".json") ? "application/json"
+            : filePath.endsWith(".wasm") ? "application/wasm"
+            : "text/html";
+          res.writeHead(200, { "Content-Type": ext });
+          res.end(readFileSync(filePath));
+          return;
+        }
+        res.writeHead(404);
+        res.end("Not found");
+      });
+
+      bridgeWs = new WebSocket.Server({ server: httpServer, path: "/websockify" });
+      bridgeWs.on("connection", (clientWs: any) => {
+        const targetWs = new WebSocket(`ws://127.0.0.1:${WS_INTERNAL}`);
+        targetWs.on("error", (err: Error) => {
+          console.error("[websockify bridge] target error:", err.message);
+          try { clientWs.close(); } catch {}
+        });
+        clientWs.on("error", (err: Error) => {
+          console.error("[websockify bridge] client error:", err.message);
+          try { targetWs.close(); } catch {}
+        });
+        targetWs.on("open", () => {
+          clientWs.on("message", (data: Buffer) => {
+            if (targetWs.readyState === WebSocket.OPEN) targetWs.send(data);
+          });
+          targetWs.on("message", (data: Buffer) => {
+            if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data);
+          });
+        });
+        clientWs.on("close", () => { try { targetWs.close(); } catch {} });
+        targetWs.on("close", () => { try { clientWs.close(); } catch {} });
+      });
+
+      // Listen — reject on error (e.g. port occupied)
+      await new Promise<void>((resolveListen, rejectListen) => {
+        httpServer.once("error", (err: Error) => rejectListen(err));
+        httpServer.listen(WEB_PORT, "127.0.0.1", () => {
+          httpServer.removeListener("error", rejectListen);
+          resolveListen();
+        });
+      });
+      log("http", `serving on http://127.0.0.1:${WEB_PORT}`);
+    } catch (err) {
+      // Clean up partial startup
+      killAll();
+      if (bridgeWs) { try { bridgeWs.close(); } catch {} bridgeWs = null; }
+      if (httpServer) { try { httpServer.close(); } catch {} httpServer = null; }
+      throw err;
+    }
+  })();
+
+  try {
+    await startupPromise;
+  } finally {
+    startupPromise = null;
+  }
+}
+
+export async function handleGetUrl(
+  _input: ZodOutput<typeof browserGetUrl.input>,
+): Promise<ZodOutput<typeof browserGetUrl.output>> {
+  try {
+    await startVncStack();
+    return { url: `http://127.0.0.1:${WEB_PORT}/`, error: null };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error("[browser-tab] GetUrl error:", msg);
+    return { url: "", error: msg };
+  }
+}
+
+export async function cleanupSessions(): Promise<void> {
+  cancelled = true; // signal in-progress startup to abort
+  if (startupPromise) {
+    try { await startupPromise.catch(() => {}); } catch {}
+  }
+  if (bridgeWs) { try { bridgeWs.close(); } catch {} bridgeWs = null; }
+  if (httpServer) { try { httpServer.close(); } catch {} httpServer = null; }
+  killAll();
 }

@@ -60,8 +60,23 @@ export function BrowserTabPanel({
   useEffect(() => {
     if (initRef.current) return;
     initRef.current = true;
-    void init();
+    // Only start the VNC stack on web — mobile can't render iframes
+    if (Platform.OS === "web") {
+      void init();
+    } else {
+      setLoading(false);
+    }
   }, [init]);
+
+  if (Platform.OS !== "web") {
+    return (
+      <View style={styles.loading}>
+        <Text style={{ color: theme.colors.foregroundMuted, padding: 16, textAlign: "center" }}>
+          Browser tab is available on the Paseo web client. Open this workspace from a browser at http://127.0.0.1:6767/
+        </Text>
+      </View>
+    );
+  }
 
   if (loading) {
     return (
@@ -94,16 +109,6 @@ export function BrowserTabPanel({
         <Pressable style={styles.retryBtn} onPress={() => void init()}>
           <Text style={styles.retryText}>Retry</Text>
         </Pressable>
-      </View>
-    );
-  }
-
-  if (Platform.OS !== "web") {
-    return (
-      <View style={styles.loading}>
-        <Text style={{ color: theme.colors.foregroundMuted, padding: 16, textAlign: "center" }}>
-          Browser tab is available on the Paseo web client. Open this workspace from a browser at http://127.0.0.1:6767/
-        </Text>
       </View>
     );
   }

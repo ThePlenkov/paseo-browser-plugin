@@ -158,12 +158,14 @@ function log(tag: string, msg: string) {
   console.log(`[browser-tab] ${tag}: ${msg}`);
 }
 
-// --- Readiness check: wait for a TCP port to be connectable ---
-function waitForPort(port: number, host: string, timeoutMs: number): Promise<boolean> {
+// --- Readiness check: wait for a TCP port to be connectable, fail if the owning process exits ---
+function waitForPort(port: number, host: string, timeoutMs: number, proc?: ChildProcess): Promise<boolean> {
   const net = _require("node:net");
   return new Promise((resolve) => {
     const start = Date.now();
     function tryConnect() {
+      if (proc && proc.exitCode !== null && proc.signalCode === null) return resolve(false);
+      if (proc && proc.killed) return resolve(false);
       if (Date.now() - start > timeoutMs) return resolve(false);
       const sock = new net.Socket();
       sock.setTimeout(500);
@@ -202,8 +204,8 @@ function sleep(ms: number): Promise<void> {
 }
 
 async function startVncStack(): Promise<void> {
-  if (xvfbProcess && !xvfbProcess.killed) return;
   if (startupPromise) return startupPromise;
+  if (xvfbProcess && !xvfbProcess.killed) return;
 
   cancelled = false;
   startupPromise = (async () => {
@@ -284,7 +286,7 @@ async function startVncStack(): Promise<void> {
       x11vncProcess.stderr?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
       x11vncProcess.stdout?.on("data", (d: Buffer) => console.log("[x11vnc]", d.toString().trim()));
       // Wait for VNC port readiness instead of fixed sleep
-      if (!await waitForPort(VNC_PORT, "127.0.0.1", 5000)) {
+      if (!await waitForPort(VNC_PORT, "127.0.0.1", 5000, x11vncProcess)) {
         throw new Error("x11vnc did not become ready");
       }
       if (cancelled) throw new Error("startup cancelled");
@@ -297,7 +299,7 @@ async function startVncStack(): Promise<void> {
       ], { stdio: ["ignore", "pipe", "pipe"] });
       websockifyProcess.stderr?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
       websockifyProcess.stdout?.on("data", (d: Buffer) => console.log("[websockify]", d.toString().trim()));
-      if (!await waitForPort(WS_INTERNAL, "127.0.0.1", 5000)) {
+      if (!await waitForPort(WS_INTERNAL, "127.0.0.1", 5000, websockifyProcess)) {
         throw new Error("websockify did not become ready");
       }
       if (cancelled) throw new Error("startup cancelled");
@@ -315,17 +317,19 @@ async function startVncStack(): Promise<void> {
           return;
         }
         // Serve noVNC files — prevent path traversal + directory access + symlink escape
-        const filePath = realpathSync(resolve(join(novncPathResolved, urlPath)));
-        if (filePath.startsWith(novncPathResolved + sep) && statSync(filePath).isFile()) {
-          const ext = filePath.endsWith(".js") ? "application/javascript"
-            : filePath.endsWith(".css") ? "text/css"
-            : filePath.endsWith(".json") ? "application/json"
-            : filePath.endsWith(".wasm") ? "application/wasm"
-            : "text/html";
-          res.writeHead(200, { "Content-Type": ext });
-          res.end(readFileSync(filePath));
-          return;
-        }
+        try {
+          const filePath = realpathSync(resolve(join(novncPathResolved, urlPath)));
+          if (filePath.startsWith(novncPathResolved + sep) && statSync(filePath).isFile()) {
+            const ext = filePath.endsWith(".js") ? "application/javascript"
+              : filePath.endsWith(".css") ? "text/css"
+              : filePath.endsWith(".json") ? "application/json"
+              : filePath.endsWith(".wasm") ? "application/wasm"
+              : "text/html";
+            res.writeHead(200, { "Content-Type": ext });
+            res.end(readFileSync(filePath));
+            return;
+          }
+        } catch {}
         res.writeHead(404);
         res.end("Not found");
       });
@@ -355,9 +359,10 @@ async function startVncStack(): Promise<void> {
 
       // Listen — reject on error (e.g. port occupied)
       await new Promise<void>((resolveListen, rejectListen) => {
-        httpServer.once("error", (err: Error) => rejectListen(err));
+        const onError = (err: Error) => rejectListen(err);
+        httpServer.once("error", onError);
         httpServer.listen(WEB_PORT, "127.0.0.1", () => {
-          httpServer.removeListener("error", rejectListen);
+          httpServer.removeListener("error", onError);
           resolveListen();
         });
       });

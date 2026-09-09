@@ -11,7 +11,7 @@ A [Paseo](https://paseo.sh) plugin that adds a **Browser** workspace tab — a f
 - Native input — clicks, keyboard, scroll all work through VNC
 - Auto-restarts Chromium if closed
 - No noVNC UI chrome — just the browser
-- Access daemon-local services (`localhost:3000`, etc.) from remote/mobile clients
+- Access daemon-local services (`localhost:3000`, etc.) from remote clients using the Paseo web client
 
 ## Requirements
 
@@ -40,6 +40,7 @@ sudo apt-get install -y xvfb x11vnc fluxbox websockify novnc
 
 ```bash
 npm install
+npx playwright install chromium
 paseo plugin install /absolute/path/to/paseo-browser-plugin
 ```
 

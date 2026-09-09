@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createServer } from "node:http";
-import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync } from "node:fs";
-import { join, resolve, normalize, delimiter } from "node:path";
+import { readFileSync, existsSync, mkdirSync, writeFileSync, readdirSync, mkdtempSync, statSync } from "node:fs";
+import { join, resolve, normalize, delimiter, sep } from "node:path";
 import { tmpdir } from "node:os";
 import type { output as ZodOutput } from "zod";
 import { browserGetUrl } from "./browser-tab.shared";
@@ -311,9 +311,9 @@ async function startVncStack(): Promise<void> {
           res.end(NOVNC_EMBED_HTML);
           return;
         }
-        // Serve noVNC files — prevent path traversal
-        const filePath = normalize(resolve(join(novncPathResolved, urlPath)));
-        if (filePath.startsWith(novncPathResolved) && existsSync(filePath)) {
+        // Serve noVNC files — prevent path traversal + directory access
+        const filePath = resolve(join(novncPathResolved, urlPath));
+        if (filePath.startsWith(novncPathResolved + sep) && existsSync(filePath) && statSync(filePath).isFile()) {
           const ext = filePath.endsWith(".js") ? "application/javascript"
             : filePath.endsWith(".css") ? "text/css"
             : filePath.endsWith(".json") ? "application/json"

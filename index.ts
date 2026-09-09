@@ -1,11 +1,10 @@
 import type { PluginContext } from "@getpaseo/plugin";
 import { BrowserTabPanel } from "./browser-tab.client";
-import { handleLinks, handleNavigate } from "./browser-tab.server";
-import { linkList, navigate } from "./browser-tab.shared";
+import { cleanupSessions, handleGetUrl } from "./browser-tab.server";
+import { browserGetUrl } from "./browser-tab.shared";
 
 export default function contribute(plugin: PluginContext) {
-  plugin.handle(navigate, handleNavigate);
-  plugin.handle(linkList, handleLinks);
+  plugin.handle(browserGetUrl, handleGetUrl);
 
   plugin.addWorkspacePanel({
     id: "browser-tab",
@@ -27,5 +26,7 @@ export default function contribute(plugin: PluginContext) {
     },
   });
 
-  return () => {};
+  return async () => {
+    await cleanupSessions();
+  };
 }

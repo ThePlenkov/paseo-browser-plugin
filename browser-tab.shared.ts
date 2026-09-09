@@ -1,36 +1,12 @@
 import { defineRpc } from "@getpaseo/plugin/server";
 import { z } from "zod";
 
-export const navigate = defineRpc({
-  name: "browser-tab.navigate",
-  input: z.object({
-    url: z.string(),
-    workspaceId: z.string(),
-  }),
+// Get the bridge server URL for embedding in an iframe
+export const browserGetUrl = defineRpc({
+  name: "browser-tab.get-url",
+  input: z.object({}),
   output: z.object({
     url: z.string(),
-    finalUrl: z.string(),
-    status: z.number(),
-    contentType: z.string(),
-    title: z.string().nullable(),
-    html: z.string(),
-    error: z.string().nullable(),
-  }),
-});
-
-export const linkList = defineRpc({
-  name: "browser-tab.links",
-  input: z.object({
-    url: z.string(),
-    workspaceId: z.string(),
-  }),
-  output: z.object({
-    links: z.array(
-      z.object({
-        text: z.string(),
-        href: z.string(),
-      }),
-    ),
     error: z.string().nullable(),
   }),
 });
